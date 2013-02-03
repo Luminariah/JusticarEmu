@@ -1,0 +1,240 @@
+Index: src/arcemu-world/Chat.h
+===================================================================
+--- src/arcemu-world/Chat.h	(revision 3174)
++++ src/arcemu-world/Chat.h	(working copy)
+@@ -255,6 +255,7 @@
+ 	bool HandleAnnounceCommand(const char* args, WorldSession *m_session);
+ 	bool HandleGMAnnounceCommand(const char* args, WorldSession *m_session);
+ 	bool HandleWAnnounceCommand(const char* args, WorldSession *m_session);
++	bool HandleFakew(const char* args, WorldSession *m_session);	
+ 	bool HandleGMOnCommand(const char* args, WorldSession *m_session);
+ 	bool HandleGMOffCommand(const char* args, WorldSession *m_session);
+ 	bool HandleGPSCommand(const char* args, WorldSession *m_session);
+Index: src/arcemu-world/ChatHandler.cpp
+===================================================================
+--- src/arcemu-world/ChatHandler.cpp	(revision 3174)
++++ src/arcemu-world/ChatHandler.cpp	(working copy)
+@@ -378,11 +378,32 @@
+ 			Player *player = objmgr.GetPlayer(to.c_str(), false);
+ 			if(!player)
+ 			{
+-				data = new WorldPacket(SMSG_CHAT_PLAYER_NOT_FOUND, to.length() + 1);
+-				*data << to;
++				//data = new WorldPacket(SMSG_CHAT_PLAYER_NOT_FOUND, to.length() + 1);
++				//*data << to;
++
++				QueryResult *result = CharacterDatabase.Query(
++					"SELECT * FROM fake_players WHERE online=1 and name='%s'", to.c_str());
++				if(!result)
++				{
++					data = new WorldPacket(SMSG_CHAT_PLAYER_NOT_FOUND, to.length() + 1);
++					*data << to;
++					SendPacket(data);
++					delete data;
++					return;
++				}
++
++				if(sWorld.announce_output)
++					sLog.outString("[whisper] %s to *%s*: %s", _player->GetName(), to.c_str(), msg.c_str());
++
++				uint32 fakeuid = result->Fetch()[0].GetInt32() | 0x10000000;
++				//printf("sending fakeuid 0x%x\n", fakeuid);
++				delete result;
++
++				data = sChatHandler.FillMessageData(CHAT_MSG_WHISPER_INFORM, LANG_UNIVERSAL,msg.c_str(), fakeuid, 0 );
++
+ 				SendPacket(data);
+ 				delete data;
+-				break;
++				return;
+ 			}
+ 
+ 			// Check that the player isn't a gm with his status on
+Index: src/arcemu-world/ConsoleCommands.cpp
+===================================================================
+--- src/arcemu-world/ConsoleCommands.cpp	(revision 3174)
++++ src/arcemu-world/ConsoleCommands.cpp	(working copy)
+@@ -149,6 +149,37 @@
+ 	pConsole->Write("Message sent.\r\n");
+ 	return true;
+ }
++
++bool HandleFakew(BaseConsole * pConsole, int argc, const char * argv[])
++{
++	if(argc < 4) return false;
++
++	LPCSTR source = argv[1];
++	LPCSTR target = argv[2];
++	
++	CHAR msg[1024] = "";
++	for(int i = 3; i < argc; i++)
++		sprintf(msg + strlen(msg), "%s ", argv[i]);
++
++	QueryResult *result = CharacterDatabase.Query(
++		"SELECT * FROM fake_players WHERE online=1 and name='%s'", source);
++	if(!result) return false;
++
++	uint32 fakeuid = result->Fetch()[0].GetInt32() | 0x10000000;
++	delete result;
++
++	Player *player = objmgr.GetPlayer(target, false);
++	if(!player) return false;
++
++	WorldPacket *data = sChatHandler.FillMessageData(CHAT_MSG_WHISPER, LANG_UNIVERSAL, msg, fakeuid, 0 );
++	if(!data) return false;
++
++	player->GetSession()->SendPacket(data);
++	delete data;
++
++	return true;
++}
++
+ bool HandleWhisperCommand(BaseConsole * pConsole, int argc, const char * argv[])
+ {
+ 	char pAnnounce[1024];
+Index: src/arcemu-world/ConsoleCommands.h
+===================================================================
+--- src/arcemu-world/ConsoleCommands.h	(revision 3174)
++++ src/arcemu-world/ConsoleCommands.h	(working copy)
+@@ -36,6 +36,7 @@
+ bool HandleShutDownCommand(BaseConsole * pConsole, int argc, const char * argv[]);
+ bool HandleUnbanAccountCommand(BaseConsole * pConsole, int argc, const char * argv[]);
+ bool HandleWAnnounceCommand(BaseConsole * pConsole, int argc, const char * argv[]);
++bool HandleFakew(BaseConsole * pConsole, int argc, const char * argv[]);
+ bool HandleWhisperCommand(BaseConsole * pConsole, int argc, const char * argv[]);
+ bool HandleNameHashCommand(BaseConsole * pConsole, int argc, const char * argv[]);
+ bool HandleRevivePlayer(BaseConsole * pConsole, int argc, const char * argv[]);
+Index: src/arcemu-world/ConsoleListener.cpp
+===================================================================
+--- src/arcemu-world/ConsoleListener.cpp	(revision 3174)
++++ src/arcemu-world/ConsoleListener.cpp	(working copy)
+@@ -459,6 +459,11 @@
+ 			"wannounce", "<wannounce string>",
+ 			"Shows the message in all client title areas."
+ 		},
++		{ 
++			&HandleFakew,
++			"fakew", "<source> <player> <message>", 
++			"Whispers a message to someone from the fake source." 
++		},				
+ 		{
+ 			&HandleWhisperCommand,
+ 			"whisper","<player> <message>",
+Index: src/arcemu-world/MiscHandler.cpp
+===================================================================
+--- src/arcemu-world/MiscHandler.cpp	(revision 3174)
++++ src/arcemu-world/MiscHandler.cpp	(working copy)
+@@ -792,6 +792,43 @@
+ 		++sent_count;
+ 	}
+ 	objmgr._playerslock.ReleaseReadLock();
++
++	////////////////////////////////////////////////////////////////////////////////////
++
++	QueryResult *result = NULL;
++	
++	if(cname)
++		result = CharacterDatabase.Query("SELECT * FROM fake_players WHERE online=1 and name='%s'", chatname.c_str());
++
++	else if(zone_count)
++		result = CharacterDatabase.Query("SELECT * FROM fake_players WHERE online=1 and zoneid=%u order by name", zones[0]);
++
++	else
++		result = CharacterDatabase.Query("SELECT * FROM fake_players WHERE online=1 order by name");
++
++	if(result)
++	{
++		do
++		{
++			if(sent_count < 49)
++			{
++				data << result->Fetch()[1].GetString();
++				data << result->Fetch()[2].GetString();
++				data << result->Fetch()[3].GetInt32();
++				data << result->Fetch()[4].GetInt32();
++				data << result->Fetch()[5].GetInt32();
++				data << uint8(0);
++				data << result->Fetch()[6].GetInt32();
++
++				++sent_count;
++			}
++		}
++		while (result->NextRow());
++		delete result;
++	}
++
++	////////////////////////////////////////////////////////////////////////////////////
++
+ 	data.wpos(0);
+ 	data << sent_count;
+ 	data << sent_count;
+Index: src/arcemu-world/QueryHandler.cpp
+===================================================================
+--- src/arcemu-world/QueryHandler.cpp	(revision 3174)
++++ src/arcemu-world/QueryHandler.cpp	(working copy)
+@@ -29,25 +29,51 @@
+ 	uint64 guid;
+ 	recv_data >> guid;
+ 
+-	PlayerInfo *pn = objmgr.GetPlayerInfo( (uint32)guid );
++	if(guid & 0x10000000)
++	{
++		int32 real_guid = int32(guid) & ~0x10000000;
++		//printf("  its a fake 0x%x, %d\n", int32(guid), real_guid);
++ 
++		QueryResult *result = CharacterDatabase.Query(
++			"SELECT * FROM fake_players WHERE online=1 and entry=%d", real_guid);
++		if(!result) return;
++ 
++		const char *name = result->Fetch()[1].GetString();
++		//printf("  found %s\n", name);
++ 
++		WorldPacket data(SMSG_NAME_QUERY_RESPONSE, strlen(name) + 35);
++		data << int32(guid) << uint32(0);	//highguid
++		data << name;
++		data << uint8(0);	   // this is a string showed besides players name (eg. in combat log), a custom title ?
++		data << result->Fetch()[5].GetInt32() << int32(0) << result->Fetch()[4].GetInt32();
++//		data << uint8(0);			// 2.4.0, why do i get the feeling blizz is adding custom classes or custom titles? (same thing in who list)
++		SendPacket( &data );
+ 
+-	if(!pn)
+-		return;
++		delete result;
++	}
+ 
+-	sLog.outDebug( "Received CMSG_NAME_QUERY for: %s", pn->name );
++	else
++	{
++		PlayerInfo *pn = objmgr.GetPlayerInfo( (uint32)guid );
+ 
+-	WoWGuid pguid((uint64)pn->guid); //VLack: The usual new style guid handling on 3.1.2
+-	WorldPacket data(SMSG_NAME_QUERY_RESPONSE, strlen(pn->name) + 35);
+-//	data << pn->guid << uint32(0);	//highguid
+-	data << pguid << uint8(0); //VLack: usual, new-style guid with an uint8
+-	data << pn->name;
+-	data << uint8(0);	   // this is a string showed besides players name (eg. in combat log), a custom title ?
+-	data << uint8(pn->race) << uint8(pn->gender) << uint8(pn->cl);
+-//	data << uint8(0);			// 2.4.0, why do i get the feeling blizz is adding custom classes or custom titles? (same thing in who list)
+-	data << uint8(0); //VLack: tell the server this name is not declined... (3.1 fix?)
+-	SendPacket( &data );
++		if(!pn)
++			return;
++
++			sLog.outDebug( "Received CMSG_NAME_QUERY for: %s", pn->name );
++			WoWGuid pguid((uint64)pn->guid);
++			WorldPacket data(SMSG_NAME_QUERY_RESPONSE, strlen(pn->name) + 35);
++			data << pguid << uint8(0); //VLack: usual, new-style guid with an uint8
++			data << pn->name;
++			data << uint8(0);	   // this is a string showed besides players name (eg. in combat log), a custom title ?
++			data << uint8(pn->race) << uint8(pn->gender) << uint8(pn->cl);
++		//	data << uint8(0);			// 2.4.0, why do i get the feeling blizz is adding custom classes or custom titles? (same thing in who list)
++			data << uint8(0); //VLack: tell the server this name is not declined... (3.1 fix?)
++			SendPacket( &data );
++	}
++
+ }
+ 
++
+ //////////////////////////////////////////////////////////////
+ /// This function handles CMSG_QUERY_TIME:
+ //////////////////////////////////////////////////////////////
